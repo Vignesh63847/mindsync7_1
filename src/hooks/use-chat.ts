@@ -1,0 +1,220 @@
+import { useState, useCallback, useEffect } from "react";
+import { supabase } from "@/integrations/supabase/client";
+import { useAuth } from "@/contexts/AuthContext";
+
+export type Msg = { role: "user" | "assistant"; content: string };
+
+export interface Conversation {
+  id: string;
+  title: string;
+  created_at: string;
+  updated_at: string;
+}
+
+const CHAT_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/chat`;
+
+export function useChat() {
+  const { user } = useAuth();
+  const [messages, setMessages] = useState<Msg[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
+
+  // Load conversation list
+  const loadConversations = useCallback(async () => {
+    if (!user) return;
+    const { data } = await supabase
+      .from("conversations")
+      .select("id, title, created_at, updated_at")
+      .eq("user_id", user.id)
+      .order("updated_at", { ascending: false });
+    if (data) setConversations(data);
+  }, [user]);
+
+  useEffect(() => {
+    loadConversations();
+  }, [loadConversations]);
+
+  // Load messages for a conversation
+  const loadConversation = useCallback(async (conversationId: string) => {
+    const { data } = await supabase
+      .from("messages")
+      .select("role, content")
+      .eq("conversation_id", conversationId)
+      .order("created_at", { ascending: true });
+    if (data) {
+      setMessages(data as Msg[]);
+      setActiveConversationId(conversationId);
+    }
+  }, []);
+
+  // Create a new conversation
+  const startNewChat = useCallback(async () => {
+    setMessages([]);
+    setActiveConversationId(null);
+  }, []);
+
+  // Delete a conversation
+  const deleteConversation = useCallback(async (id: string) => {
+    await supabase.from("conversations").delete().eq("id", id);
+    if (activeConversationId === id) {
+      setMessages([]);
+      setActiveConversationId(null);
+    }
+    loadConversations();
+  }, [activeConversationId, loadConversations]);
+
+  const send = useCallback(async (input: string) => {
+    if (!user) return;
+    const userMsg: Msg = { role: "user", content: input };
+    const allMessages = [...messages, userMsg];
+    setMessages((prev) => [...prev, userMsg]);
+    setIsLoading(true);
+
+    let convId = activeConversationId;
+
+    // Create conversation if none active
+    if (!convId) {
+      const title = input.length > 40 ? input.slice(0, 40) + "…" : input;
+      const { data } = await supabase
+        .from("conversations")
+        .insert({ user_id: user.id, title })
+        .select("id")
+        .single();
+      if (data) {
+        convId = data.id;
+        setActiveConversationId(convId);
+      }
+    }
+
+    // Save user message
+    if (convId) {
+      await supabase.from("messages").insert({
+        conversation_id: convId,
+        role: "user",
+        content: input,
+      });
+    }
+
+    let assistantSoFar = "";
+
+    try {
+      const resp = await fetch(CHAT_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
+        },
+        body: JSON.stringify({ messages: allMessages }),
+      });
+
+      if (!resp.ok || !resp.body) {
+        throw new Error(`Failed: ${resp.status}`);
+      }
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let textBuffer = "";
+      let streamDone = false;
+
+      while (!streamDone) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        textBuffer += decoder.decode(value, { stream: true });
+
+        let newlineIndex: number;
+        while ((newlineIndex = textBuffer.indexOf("\n")) !== -1) {
+          let line = textBuffer.slice(0, newlineIndex);
+          textBuffer = textBuffer.slice(newlineIndex + 1);
+
+          if (line.endsWith("\r")) line = line.slice(0, -1);
+          if (line.startsWith(":") || line.trim() === "") continue;
+          if (!line.startsWith("data: ")) continue;
+
+          const jsonStr = line.slice(6).trim();
+          if (jsonStr === "[DONE]") {
+            streamDone = true;
+            break;
+          }
+
+          try {
+            const parsed = JSON.parse(jsonStr);
+            const content = parsed.choices?.[0]?.delta?.content as string | undefined;
+            if (content) {
+              assistantSoFar += content;
+              const current = assistantSoFar;
+              setMessages((prev) => {
+                const last = prev[prev.length - 1];
+                if (last?.role === "assistant") {
+                  return prev.map((m, i) => (i === prev.length - 1 ? { ...m, content: current } : m));
+                }
+                return [...prev, { role: "assistant", content: current }];
+              });
+            }
+          } catch {
+            textBuffer = line + "\n" + textBuffer;
+            break;
+          }
+        }
+      }
+
+      // Final flush
+      if (textBuffer.trim()) {
+        for (let raw of textBuffer.split("\n")) {
+          if (!raw) continue;
+          if (raw.endsWith("\r")) raw = raw.slice(0, -1);
+          if (raw.startsWith(":") || raw.trim() === "") continue;
+          if (!raw.startsWith("data: ")) continue;
+          const jsonStr = raw.slice(6).trim();
+          if (jsonStr === "[DONE]") continue;
+          try {
+            const parsed = JSON.parse(jsonStr);
+            const content = parsed.choices?.[0]?.delta?.content as string | undefined;
+            if (content) {
+              assistantSoFar += content;
+              const current = assistantSoFar;
+              setMessages((prev) => {
+                const last = prev[prev.length - 1];
+                if (last?.role === "assistant") {
+                  return prev.map((m, i) => (i === prev.length - 1 ? { ...m, content: current } : m));
+                }
+                return [...prev, { role: "assistant", content: current }];
+              });
+            }
+          } catch { /* ignore */ }
+        }
+      }
+
+      // Save assistant message
+      if (convId && assistantSoFar) {
+        await supabase.from("messages").insert({
+          conversation_id: convId,
+          role: "assistant",
+          content: assistantSoFar,
+        });
+        // Update conversation timestamp
+        await supabase.from("conversations").update({ updated_at: new Date().toISOString() }).eq("id", convId);
+        loadConversations();
+      }
+    } catch (e) {
+      console.error("Chat error:", e);
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: "I'm having trouble connecting right now. Please try again in a moment. 💙" },
+      ]);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [messages, user, activeConversationId, loadConversations]);
+
+  const clearChat = useCallback(() => {
+    setMessages([]);
+    setActiveConversationId(null);
+  }, []);
+
+  return {
+    messages, isLoading, send, clearChat,
+    conversations, loadConversation, startNewChat, deleteConversation,
+    activeConversationId,
+  };
+}
