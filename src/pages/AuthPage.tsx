@@ -54,14 +54,15 @@ export default function AuthPage() {
     }
   };
 
-  const handleGoogleSignIn = async () => {
-    const { error } = await lovable.auth.signInWithOAuth("google", {
-      redirect_uri: window.location.origin,
-    });
-    if (error) {
-      toast({ title: "Error", description: error.message, variant: "destructive" });
-    }
-  };
+const handleGoogleSignIn = async () => {
+  const { error } = await lovable.auth.signInWithOAuth("google", {
+    redirect_uri: "https://mindsync7-1.vercel.app", // ✅ FIXED
+  });
+
+  if (error) {
+    toast({ title: "Error", description: error.message, variant: "destructive" });
+  }
+};
 
   return (
     <div className="min-h-screen flex items-center justify-center px-4 pt-20 pb-8">
